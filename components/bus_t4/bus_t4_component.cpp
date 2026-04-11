@@ -135,7 +135,9 @@ void BusT4Component::rxTask() {
             // Both checksums valid - accept packet
             ESP_LOGD(TAG, "Received packet: %s (%d bytes)",
                      format_hex_pretty(packet.data, packet.size).c_str(), packet.size);
-            xQueueSend(rxQueue_, &packet, portMAX_DELAY);
+            if (!xQueueSend(rxQueue_, &packet, pdMS_TO_TICKS(100))) {
+              ESP_LOGW(TAG, "RX queue full, dropping packet");
+            }
           } else {
             ESP_LOGW(TAG, "Trailing size mismatch: expected 0x%02X, got 0x%02X", expected_size, byte);
           }
