@@ -12,12 +12,30 @@ static const char *TAG = "bus_t4.cover";
 
 cover::CoverTraits BusT4Cover::get_traits() {
   auto traits = cover::CoverTraits();
-  traits.set_is_assumed_state(false);  // We track actual state now
-  traits.set_supports_position(true);
+  const bool support_position = (position_mode_ != PositionMode::NONE);
+  traits.set_is_assumed_state(position_mode_ == PositionMode::NONE || position_mode_ == PositionMode::ENDPOINT);
+  traits.set_supports_position(support_position);
   traits.set_supports_tilt(false);
   traits.set_supports_toggle(false);
   traits.set_supports_stop(true);
   return traits;
+}
+
+void BusT4Cover::set_position_mode(const std::string &mode) {
+  std::string lower_mode = mode;
+  std::transform(lower_mode.begin(), lower_mode.end(), lower_mode.begin(), ::tolower);
+  if (lower_mode == "encoder") {
+    position_mode_ = PositionMode::ENCODER;
+  } else if (lower_mode == "estimated") {
+    position_mode_ = PositionMode::ESTIMATED;
+  } else if (lower_mode == "endpoint") {
+    position_mode_ = PositionMode::ENDPOINT;
+  } else if (lower_mode == "none") {
+    position_mode_ = PositionMode::NONE;
+  } else {
+    ESP_LOGW(TAG, "Unknown position mode '%s', defaulting to encoder", mode.c_str());
+    position_mode_ = PositionMode::ENCODER;
+  }
 }
 
 void BusT4Cover::setup() {
@@ -45,22 +63,23 @@ void BusT4Cover::loop() {
 
   // Periodic status refresh every 15 seconds
   // This helps recover from missed packets and keeps state in sync
-  if (init_ok_ && (now - last_status_refresh_ > 15000)) {
+  if (init_ok_ && status_refresh_interval_ > 0 && (now - last_status_refresh_ > status_refresh_interval_)) {
     last_status_refresh_ = now;
 
     // If idle, request current status
     if (current_operation == cover::COVER_OPERATION_IDLE) {
-      ESP_LOGV(TAG, "Periodic status refresh");
+      ESP_LOGV(TAG, "Periodic status refresh every %ums", status_refresh_interval_);
       request_status();
       // Also request position if we have encoder support
-      if (has_encoder_ && !is_robus_) {
+      if (has_encoder_ && !is_robus_ && position_mode_ == PositionMode::ENCODER) {
         request_position();
       }
     }
   }
 
   // Time-based position tracking during movement
-  if (movement_start_time_ > 0 && current_operation != cover::COVER_OPERATION_IDLE) {
+  // Only active in estimated mode
+  if (movement_start_time_ > 0 && current_operation != cover::COVER_OPERATION_IDLE && position_mode_ == PositionMode::ESTIMATED) {
     uint32_t elapsed = now - movement_start_time_;
     float new_position = position_at_start_;
 
@@ -96,7 +115,7 @@ void BusT4Cover::loop() {
 
     // Poll encoder position during movement (for devices that support it)
     // Robus devices don't support position queries during movement
-    if (!is_robus_ && init_ok_) {
+    if (!is_robus_ && init_ok_ && position_mode_ == PositionMode::ENCODER) {
       if (now - last_position_update_ >= position_report_interval_) {
         last_position_update_ = now;
         request_position();
@@ -104,7 +123,7 @@ void BusT4Cover::loop() {
     }
 
     // Check if we've reached target position (always check, don't rate-limit)
-    if (target_position_ >= 0.0f) {
+    if (target_position_ >= 0.0f && position_mode_ != PositionMode::NONE) {
       bool target_reached = false;
       if (current_operation == cover::COVER_OPERATION_OPENING && this->position >= target_position_) {
         target_reached = true;
@@ -125,8 +144,11 @@ void BusT4Cover::dump_config() {
   LOG_COVER("", "Bus T4 Cover", this);
   ESP_LOGCONFIG(TAG, "  Initialized: %s", init_ok_ ? "Yes" : "No");
   ESP_LOGCONFIG(TAG, "  Auto-learn timing: %s", auto_learn_timing_ ? "Yes" : "No");
+  const bool support_position = (position_mode_ != PositionMode::NONE);
+  ESP_LOGCONFIG(TAG, "  Supports position: %s", YESNO(support_position));
   ESP_LOGCONFIG(TAG, "  Open duration: %.1fs", open_duration_ / 1000.0f);
   ESP_LOGCONFIG(TAG, "  Close duration: %.1fs", close_duration_ / 1000.0f);
+  ESP_LOGCONFIG(TAG, "  Status refresh interval: %u ms", status_refresh_interval_);
   if (init_ok_) {
     const char *type_str = "Unknown";
     switch (motor_type_) {
@@ -159,11 +181,25 @@ void BusT4Cover::dump_config() {
     }
 
     // Position tracking mode
-    if (has_encoder_) {
-      ESP_LOGCONFIG(TAG, "  Position source: Encoder (primary)");
-    } else {
-      ESP_LOGCONFIG(TAG, "  Position source: Time-based estimation");
+    switch (position_mode_) {
+      case PositionMode::ENCODER:
+        ESP_LOGCONFIG(TAG, "  Position source: Encoder (primary)");
+        break;
+      case PositionMode::ESTIMATED:
+        ESP_LOGCONFIG(TAG, "  Position source: Time-based estimation");
+        break;
+      case PositionMode::ENDPOINT:
+        ESP_LOGCONFIG(TAG, "  Position source: Endpoint-only (open/closed confirmation)");
+        break;
+      case PositionMode::NONE:
+        ESP_LOGCONFIG(TAG, "  Position source: None (state-only)");
+        break;
     }
+    ESP_LOGCONFIG(TAG, "  Position mode: %s",
+                  position_mode_ == PositionMode::ENCODER ? "encoder" :
+                  position_mode_ == PositionMode::ESTIMATED ? "estimated" :
+                  position_mode_ == PositionMode::ENDPOINT ? "endpoint" :
+                  "none");
 
     // OXI receiver info
     if (has_oxi_) {
@@ -199,18 +235,36 @@ void BusT4Cover::control(const cover::CoverCall &call) {
         send_cmd(CMD_CLOSE);
       }
     } else {
-      // Partial position requested - calculate target encoder position
-      // For now, we just open/close based on direction
+      // Partial position requested.
       target_position_ = pos;
-      if (pos > this->position) {
-        if (current_operation != cover::COVER_OPERATION_OPENING) {
-          ESP_LOGD(TAG, "Opening cover to %.0f%%", pos * 100);
-          send_cmd(CMD_OPEN);
+      if (position_mode_ == PositionMode::ENDPOINT || position_mode_ == PositionMode::NONE) {
+        // No intermediate position tracking; only issue open/close commands.
+        ESP_LOGW(TAG, "Partial position requested but position mode '%s' does not support intermediate values; using open/close only",
+                  position_mode_ == PositionMode::ENDPOINT ? "endpoint" : "none");
+        target_position_ = -1.0f;
+        if (pos > this->position) {
+          if (current_operation != cover::COVER_OPERATION_OPENING) {
+            ESP_LOGD(TAG, "Opening cover");
+            send_cmd(CMD_OPEN);
+          }
+        } else {
+          if (current_operation != cover::COVER_OPERATION_CLOSING) {
+            ESP_LOGD(TAG, "Closing cover");
+            send_cmd(CMD_CLOSE);
+          }
         }
       } else {
-        if (current_operation != cover::COVER_OPERATION_CLOSING) {
-          ESP_LOGD(TAG, "Closing cover to %.0f%%", pos * 100);
-          send_cmd(CMD_CLOSE);
+        // Use encoder or time estimation to reach the requested target
+        if (pos > this->position) {
+          if (current_operation != cover::COVER_OPERATION_OPENING) {
+            ESP_LOGD(TAG, "Opening cover to %.0f%%", pos * 100);
+            send_cmd(CMD_OPEN);
+          }
+        } else {
+          if (current_operation != cover::COVER_OPERATION_CLOSING) {
+            ESP_LOGD(TAG, "Closing cover to %.0f%%", pos * 100);
+            send_cmd(CMD_CLOSE);
+          }
         }
       }
     }
@@ -274,10 +328,13 @@ void BusT4Cover::parse_dep_packet(const T4Packet &packet) {
       case STA_OPENING_ALT:  // Alternate code used by Road 400 and others
         ESP_LOGI(TAG, "Gate opening");
         if (current_operation != cover::COVER_OPERATION_OPENING) {
-          movement_start_time_ = millis();
-          position_at_start_ = this->position;
-          // Start learning if opening from fully closed
-          if (auto_learn_timing_ && this->position <= CLOSED_POSITION_THRESHOLD) {
+          // Set up time-based position tracking only in estimated mode
+          if (position_mode_ == PositionMode::ESTIMATED) {
+            movement_start_time_ = millis();
+            position_at_start_ = this->position;
+          }
+          // Only learn durations in estimated mode
+          if (position_mode_ == PositionMode::ESTIMATED && auto_learn_timing_ && this->position <= CLOSED_POSITION_THRESHOLD) {
             start_learning_open();
           }
         }
@@ -288,10 +345,13 @@ void BusT4Cover::parse_dep_packet(const T4Packet &packet) {
       case STA_CLOSING_ALT:  // Alternate code used by Road 400 and others
         ESP_LOGI(TAG, "Gate closing");
         if (current_operation != cover::COVER_OPERATION_CLOSING) {
-          movement_start_time_ = millis();
-          position_at_start_ = this->position;
-          // Start learning if closing from fully open
-          if (auto_learn_timing_ && this->position >= (1.0f - CLOSED_POSITION_THRESHOLD)) {
+          // Set up time-based position tracking only in estimated mode
+          if (position_mode_ == PositionMode::ESTIMATED) {
+            movement_start_time_ = millis();
+            position_at_start_ = this->position;
+          }
+          // Only learn durations in estimated mode
+          if (position_mode_ == PositionMode::ESTIMATED && auto_learn_timing_ && this->position >= (1.0f - CLOSED_POSITION_THRESHOLD)) {
             start_learning_close();
           }
         }
@@ -300,26 +360,30 @@ void BusT4Cover::parse_dep_packet(const T4Packet &packet) {
 
       case STA_OPENED:
         ESP_LOGI(TAG, "Gate fully open");
-        // Finish learning open duration if we were learning
-        if (learning_open_) {
+        // Finish learning open duration if we were learning in estimated mode
+        if (position_mode_ == PositionMode::ESTIMATED && learning_open_) {
           finish_learning_open();
         }
         cancel_learning();  // Cancel any other learning
         current_operation = cover::COVER_OPERATION_IDLE;
-        this->position = cover::COVER_OPEN;
+        if (position_mode_ != PositionMode::NONE) {
+          this->position = cover::COVER_OPEN;
+        }
         target_position_ = -1.0f;
         movement_start_time_ = 0;
         break;
 
       case STA_CLOSED:
         ESP_LOGI(TAG, "Gate fully closed");
-        // Finish learning close duration if we were learning
-        if (learning_close_) {
+        // Finish learning close duration if we were learning in estimated mode
+        if (position_mode_ == PositionMode::ESTIMATED && learning_close_) {
           finish_learning_close();
         }
         cancel_learning();  // Cancel any other learning
         current_operation = cover::COVER_OPERATION_IDLE;
-        this->position = cover::COVER_CLOSED;
+        if (position_mode_ != PositionMode::NONE) {
+          this->position = cover::COVER_CLOSED;
+        }
         target_position_ = -1.0f;
         movement_start_time_ = 0;
         break;
@@ -332,18 +396,19 @@ void BusT4Cover::parse_dep_packet(const T4Packet &packet) {
         current_operation = cover::COVER_OPERATION_IDLE;
         target_position_ = -1.0f;
         movement_start_time_ = 0;
-        // Don't trust time-based position at endpoints - it may have "completed" falsely
-        // Clamp to mid-range until confirmation
-        if (this->position <= 0.02f) {
-          this->position = 0.05f;  // Show as slightly open until confirmed
-          ESP_LOGD(TAG, "Position clamped from 0%% to 5%% pending confirmation");
-        } else if (this->position >= 0.98f) {
-          this->position = 0.95f;  // Show as slightly closed until confirmed
-          ESP_LOGD(TAG, "Position clamped from 100%% to 95%% pending confirmation");
+        if (position_mode_ == PositionMode::ENDPOINT || position_mode_ == PositionMode::NONE) {
+          ESP_LOGD(TAG, "Stopped mid-travel: preserving last known position in endpoint/none mode");
+        } else {
+          if (this->position <= 0.02f) {
+            this->position = 0.05f;
+            ESP_LOGD(TAG, "Position clamped from 0%% to 5%% pending confirmation");
+          } else if (this->position >= 0.98f) {
+            this->position = 0.95f;
+            ESP_LOGD(TAG, "Position clamped from 100%% to 95%% pending confirmation");
+          }
         }
-        // Request actual status to confirm position
         request_status_confirmation();
-        break;  // Publish now with clamped position, update when confirmed
+        break;
 
       case STA_ENDTIME:
         ESP_LOGI(TAG, "Gate operation ended (timeout)");
@@ -352,15 +417,17 @@ void BusT4Cover::parse_dep_packet(const T4Packet &packet) {
         current_operation = cover::COVER_OPERATION_IDLE;
         target_position_ = -1.0f;
         movement_start_time_ = 0;
-        // Don't trust time-based position at endpoints
-        if (this->position <= 0.02f) {
-          this->position = 0.05f;
-        } else if (this->position >= 0.98f) {
-          this->position = 0.95f;
+        if (position_mode_ == PositionMode::ENDPOINT || position_mode_ == PositionMode::NONE) {
+          ESP_LOGD(TAG, "Endtime mid-travel: preserving last known position in endpoint/none mode");
+        } else {
+          if (this->position <= 0.02f) {
+            this->position = 0.05f;
+          } else if (this->position >= 0.98f) {
+            this->position = 0.95f;
+          }
         }
-        // Request actual status to confirm position
         request_status_confirmation();
-        break;  // Publish now with clamped position, update when confirmed
+        break;
 
       case STA_PART_OPENED:
         ESP_LOGI(TAG, "Gate partially open");
@@ -405,19 +472,26 @@ void BusT4Cover::parse_dep_packet(const T4Packet &packet) {
         break;
       case STA_OPENED:
         current_operation = cover::COVER_OPERATION_IDLE;
-        this->position = cover::COVER_OPEN;
+        if (position_mode_ != PositionMode::NONE) {
+          this->position = cover::COVER_OPEN;
+        }
         break;
       case STA_CLOSED:
         current_operation = cover::COVER_OPERATION_IDLE;
-        this->position = cover::COVER_CLOSED;
+        if (position_mode_ != PositionMode::NONE) {
+          this->position = cover::COVER_CLOSED;
+        }
         break;
       case STA_STOPPED:
         current_operation = cover::COVER_OPERATION_IDLE;
         break;
     }
 
-    if (pos > 0) {
-      update_position(pos);
+    // Only use position data from device if we are in encoder mode
+    if (pos > 0 && position_mode_ == PositionMode::ENCODER) {
+      if (status != STA_STOPPED) {
+        update_position(pos);
+      }
     }
     publish_state_if_changed();
   }
@@ -522,14 +596,18 @@ void BusT4Cover::parse_dmp_packet(const T4Packet &packet) {
       switch (gate_status) {
         case STA_OPENED:
           current_operation = cover::COVER_OPERATION_IDLE;
-          this->position = cover::COVER_OPEN;
+          if (position_mode_ != PositionMode::NONE) {
+            this->position = cover::COVER_OPEN;
+          }
           if (awaiting_confirmation_) {
             ESP_LOGI(TAG, "Confirmed: gate is fully open");
           }
           break;
         case STA_CLOSED:
           current_operation = cover::COVER_OPERATION_IDLE;
-          this->position = cover::COVER_CLOSED;
+          if (position_mode_ != PositionMode::NONE) {
+            this->position = cover::COVER_CLOSED;
+          }
           if (awaiting_confirmation_) {
             ESP_LOGI(TAG, "Confirmed: gate is fully closed");
           }
@@ -557,7 +635,10 @@ void BusT4Cover::parse_dmp_packet(const T4Packet &packet) {
     }
 
     case INF_CUR_POS: {
-      // Current position response
+      // Current position response - ignored if position support or encoder position is disabled
+      if (position_mode_ != PositionMode::ENCODER) {
+        break;
+      }
       // Walky uses 1-byte position, others use 2 bytes big-endian
       uint16_t pos;
       if (is_walky_) {
@@ -624,7 +705,14 @@ void BusT4Cover::parse_dmp_packet(const T4Packet &packet) {
         switch (limit_state) {
           case 0x00:
             ESP_LOGD(TAG, "INF_IO: No limit switch active");
-            // No limit switch info - INF_STATUS will handle confirmation
+            if (position_mode_ == PositionMode::ENDPOINT && awaiting_confirmation_) {
+              ESP_LOGI(TAG, "No limit switch active in endpoint mode: assuming gate is not closed");
+              this->position = cover::COVER_OPEN;
+              current_operation = cover::COVER_OPERATION_IDLE;
+              awaiting_confirmation_ = false;
+              publish_state_if_changed();
+            }
+            // No limit switch info - INF_STATUS may still provide confirmation.
             break;
           case 0x01:
             ESP_LOGI(TAG, "Limit switch: CLOSED");
@@ -887,6 +975,7 @@ void BusT4Cover::init_oxi_device() {
 
 void BusT4Cover::request_position() {
   if (parent_ == nullptr) return;
+  if (position_mode_ != PositionMode::ENCODER) return;
   send_info_request(FOR_CU, INF_CUR_POS);
 }
 

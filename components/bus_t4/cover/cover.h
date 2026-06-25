@@ -48,11 +48,15 @@ class BusT4Cover : public cover::Cover, public BusT4Device, public Component {
   // Called when a packet is received from the bus
   void on_packet(const T4Packet &packet) override;
 
+  enum class PositionMode { ENCODER, ESTIMATED, ENDPOINT, NONE };
+
   // Configuration setters (from YAML)
   void set_open_duration(uint32_t duration) { open_duration_ = duration; }
   void set_close_duration(uint32_t duration) { close_duration_ = duration; }
   void set_auto_learn_timing(bool enable) { auto_learn_timing_ = enable; }
   void set_position_report_interval(uint32_t interval) { position_report_interval_ = interval; }
+  void set_status_refresh_interval(uint32_t interval) { status_refresh_interval_ = interval; }
+  void set_position_mode(const std::string &mode);
 
   // Motor controller configuration (runtime)
   // These send commands to the motor controller to change its settings
@@ -102,6 +106,7 @@ class BusT4Cover : public cover::Cover, public BusT4Device, public Component {
   std::string firmware_version_;       // Firmware version string
   bool is_walky_{false};               // Walky gates: 1-byte position values
   bool is_robus_{false};               // Robus gates: no position query during movement
+  PositionMode position_mode_{PositionMode::ENCODER};
 
   // OXI receiver tracking
   T4Source oxi_address_{0x00, 0x00};   // OXI receiver address (if present)
@@ -140,6 +145,7 @@ class BusT4Cover : public cover::Cover, public BusT4Device, public Component {
   uint32_t position_report_interval_{1000};  // Position report rate (ms)
   uint32_t last_init_attempt_{0};
   uint32_t last_status_refresh_{0};  // Periodic status refresh
+  uint32_t status_refresh_interval_{15000};  // 0 disables idle status polling
 
   // Position source tracking
   bool has_encoder_{false};          // True if device reports encoder positions

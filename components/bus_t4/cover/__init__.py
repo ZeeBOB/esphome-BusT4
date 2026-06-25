@@ -12,6 +12,16 @@ CONF_OPEN_DURATION = 'open_duration'
 CONF_CLOSE_DURATION = 'close_duration'
 CONF_AUTO_LEARN_TIMING = 'auto_learn_timing'
 CONF_POSITION_REPORT_INTERVAL = 'position_report_interval'
+CONF_STATUS_REFRESH_INTERVAL = "status_refresh_interval"
+CONF_POSITION_MODE = "position_mode"
+
+POSITION_MODES = ["encoder", "estimated", "endpoint", "none"]
+
+def validate_position_mode(value):
+    value = cv.string(value).lower()
+    if value not in POSITION_MODES:
+        raise cv.Invalid("position_mode must be one of: %s" % ", ".join(POSITION_MODES))
+    return value
 
 CONFIG_SCHEMA = (
     cover.cover_schema(BusT4Cover, device_class="gate")
@@ -23,6 +33,8 @@ CONFIG_SCHEMA = (
             cv.Optional(CONF_CLOSE_DURATION, default='20s'): cv.positive_time_period_milliseconds,
             cv.Optional(CONF_AUTO_LEARN_TIMING, default=True): cv.boolean,
             cv.Optional(CONF_POSITION_REPORT_INTERVAL, default='1s'): cv.positive_time_period_milliseconds,
+            cv.Optional(CONF_STATUS_REFRESH_INTERVAL, default=15000): cv.int_range(min=0),
+            cv.Optional(CONF_POSITION_MODE, default='encoder'): validate_position_mode,
         }
     )
 )
@@ -38,3 +50,5 @@ async def to_code(config):
     cg.add(var.set_close_duration(config[CONF_CLOSE_DURATION]))
     cg.add(var.set_auto_learn_timing(config[CONF_AUTO_LEARN_TIMING]))
     cg.add(var.set_position_report_interval(config[CONF_POSITION_REPORT_INTERVAL]))
+    cg.add(var.set_status_refresh_interval(config[CONF_STATUS_REFRESH_INTERVAL]))
+    cg.add(var.set_position_mode(config[CONF_POSITION_MODE]))
